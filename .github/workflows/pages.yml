@@ -1,0 +1,86 @@
+name: Publiceer CTRL UPDATE
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dist/**"
+      - "VERSION"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Controleer de openbare sitebestanden
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check dist/auth.js
+          node --input-type=module <<'JS'
+          import { readFileSync, readdirSync } from 'node:fs';
+
+          const files = readdirSync('dist').sort();
+          if (files.join(',') !== 'auth.js,index.html') {
+            throw new Error('The public site must contain only index.html and auth.js.');
+          }
+          const html = readFileSync('dist/index.html', 'utf8');
+          const bundle = readFileSync('dist/auth.js', 'utf8');
+          const marker = '<script id="payload" type="application/json">';
+          const start = html.indexOf(marker);
+          const end = html.indexOf('</script>', start + marker.length);
+          if (start < 0 || end < 0) throw new Error('The site payload is missing.');
+          const payload = JSON.parse(html.slice(start + marker.length, end));
+          const version = readFileSync('VERSION', 'utf8').trim();
+          if (payload.releaseVersion !== version || payload.preview ||
+              payload.platform?.authentication?.enabled !== true ||
+              payload.platform?.authentication?.inviteOnly !== true ||
+              payload.platform?.tenantNews?.enabled !== true ||
+              payload.platform?.tenantNews?.table !== 'tenant_news_snapshot' ||
+              payload.platform?.authentication?.redirectUrl !== 'https://news.intunetools.com/') {
+            throw new Error('The public site configuration is invalid.');
+          }
+          const publicChannels = new Set(['official', 'community', 'news']);
+          const privateSources = new Set(['Message Center', 'Microsoft 365 Service Health']);
+          const ids = new Set(payload.items.map(item => item.id));
+          if (payload.items.some(item => !publicChannels.has(item.channel) || item.kind !== 'feed' ||
+              privateSources.has(item.source) || /^(MC:|SH:)/.test(item.id) ||
+              item.tenantRelevance === 'confirmed' || item.tenantReason || item.tenantReasonEn ||
+              item.messageRef || item.preferredSource?.channel === 'tenant' ||
+              item.alsoIn?.some(source => privateSources.has(source)) ||
+              item.alsoSources?.some(source => privateSources.has(source?.name))) ||
+              payload.agenda.some(entry => !ids.has(entry.id)) ||
+              payload.feeds.some(feed => privateSources.has(feed.Source) || feed.kind === 'processing') ||
+              payload.sourceCatalog.some(source => !publicChannels.has(source.channel)) ||
+              payload.platform?.messageCenterLinks || payload.review || payload.agent ||
+              payload.duplicates || payload.publicLinks) {
+            throw new Error('The public site contains tenant or internal processing data.');
+          }
+          const privateMarker = /whsec_[A-Za-z0-9_-]{12,}|sb_secret_[A-Za-z0-9_-]{12,}|BEGIN PRIVATE KEY|CTRL_UPDATE_MAIL_CLIENT_SECRET|CTRL_UPDATE_SEND_EMAIL_HOOK_SECRET|saddik@fixsys\.nl|auth@fixsys\.nl/i;
+          if (privateMarker.test(html + bundle)) {
+            throw new Error('The public site contains a private marker.');
+          }
+          JS
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./dist
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
